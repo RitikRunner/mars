@@ -2,7 +2,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { DataSource } from 'typeorm';
 import { Channel } from '../common/enums';
-import { calculatePublishableStock } from '../common/publish-policy';
+import {
+  calculatePublishableStock,
+  DEFAULT_BLIND_WINDOWS,
+  DEFAULT_FLOORS,
+} from '../common/publish-policy';
 
 interface DirtySkuRow {
   sku: string;
@@ -11,47 +15,44 @@ interface DirtySkuRow {
   last_pushed_qty: number;
   buffer: number;
   cap: number | null;
+  updated_at: Date;
 }
 
 @Injectable()
 export class StockPushService {
   private readonly logger = new Logger(StockPushService.name);
 
-  // Simple token buckets for rate limiting per channel
-  private nykaaTokens = 4; // 4 req/s max (1 spare)
-  private flipkartTokens = 8; // 8 req/s max (2 spare for polling)
+  private nykaaTokens = 4;
+  private flipkartTokens = 8;
+  private blinkitTokens = 4;
   private isPushing = false;
 
   constructor(private readonly dataSource: DataSource) {}
 
   /**
-   * Refill token buckets every 1 second
+   * Channel Stock Pusher Loop (DESIGN.md §5)
+   * Runs every 1 second. Each bucket holds one second of tokens.
    */
   @Interval(1000)
-  refillTokenBuckets() {
-    this.nykaaTokens = 4;
-    this.flipkartTokens = 8;
-  }
-
-  /**
-   * Channel Stock Pusher Loop
-   * Runs every 2 seconds. Identifies dirty SKUs where `inventory.version > channel_stock.pushed_version`.
-   * Computes publish policy, sorts priority (zeros first, then low-stock, then oldest),
-   * and pushes to channels respecting rate limits.
-   */
-  @Interval(2000)
   async runStockPushLoop(): Promise<void> {
     if (this.isPushing) return;
     this.isPushing = true;
 
+    // Refill token buckets for this 1-second window
+    this.nykaaTokens = 4;
+    this.flipkartTokens = 8;
+    this.blinkitTokens = 4;
+
     try {
+      const velocities = await this.computeVelocities();
+
       await Promise.all([
-        this.pushToWebsite(),
-        this.pushToNykaa(),
-        this.pushToFlipkart(),
-        this.pushToBlinkit(),
+        this.pushToWebsite(velocities),
+        this.pushToNykaa(velocities),
+        this.pushToFlipkart(velocities),
+        this.pushToBlinkit(velocities),
       ]);
-    } catch (err) {
+    } catch (err: any) {
       this.logger.error('Error in stock pusher loop', err.stack);
     } finally {
       this.isPushing = false;
@@ -59,20 +60,52 @@ export class StockPushService {
   }
 
   /**
+   * Computes per-SKU velocity from stock_ledger for the last 15 minutes
+   */
+  private async computeVelocities(): Promise<Map<string, number>> {
+    const planned = Number(process.env.SALE_PLANNED_VELOCITY || 0);
+    const map = new Map<string, number>();
+
+    try {
+      const rows = await this.dataSource.query(`
+        SELECT sku, COALESCE(SUM(delta_reserved), 0) / 15.0 AS velocity
+        FROM stock_ledger
+        WHERE reason = 'RESERVE' AND created_at >= NOW() - INTERVAL '15 minutes'
+        GROUP BY sku;
+      `);
+
+      for (const r of rows) {
+        map.set(r.sku, Math.max(Number(r.velocity), planned));
+      }
+    } catch (err: any) {
+      this.logger.error('Error computing velocities', err.message);
+    }
+
+    return map;
+  }
+
+  /**
    * Website: Instant internal direct update
    */
-  private async pushToWebsite(): Promise<void> {
+  private async pushToWebsite(velocities: Map<string, number>): Promise<void> {
     const dirtySkus = await this.fetchDirtySkus(Channel.WEBSITE);
     for (const item of dirtySkus) {
+      const velocity = velocities.get(item.sku) ?? Number(process.env.SALE_PLANNED_VELOCITY || 0);
       const publishQty = calculatePublishableStock({
         channel: Channel.WEBSITE,
         sku: item.sku,
         available: Number(item.available),
-        velocityPerMin: 10,
+        velocityPerMin: velocity,
         buffer: 0,
       });
 
-      // Direct local update
+      if (publishQty === Number(item.last_pushed_qty)) {
+        // Quantity unchanged: update pushed_version only, no call, no log row
+        await this.updatePushedVersionOnly(Channel.WEBSITE, item.sku, Number(item.version));
+        continue;
+      }
+
+      await this.sendToWebsite(item.sku, publishQty);
       await this.recordPushSuccess(Channel.WEBSITE, item.sku, publishQty, Number(item.version));
     }
   }
@@ -80,79 +113,108 @@ export class StockPushService {
   /**
    * Nykaa: 1 SKU per call, rate-limited to 4 req/s
    */
-  private async pushToNykaa(): Promise<void> {
+  private async pushToNykaa(velocities: Map<string, number>): Promise<void> {
     const dirtySkus = await this.fetchDirtySkus(Channel.NYKAA);
-    const sorted = this.prioritizeSkus(dirtySkus);
+    const sorted = this.prioritizeSkus(Channel.NYKAA, dirtySkus, velocities);
 
     for (const item of sorted) {
-      if (this.nykaaTokens <= 0) break; // Token bucket exhausted for this second
-      this.nykaaTokens--;
+      if (this.nykaaTokens <= 0) break;
 
+      const velocity = velocities.get(item.sku) ?? Number(process.env.SALE_PLANNED_VELOCITY || 0);
       const publishQty = calculatePublishableStock({
         channel: Channel.NYKAA,
         sku: item.sku,
         available: Number(item.available),
-        velocityPerMin: 15,
+        velocityPerMin: velocity,
         buffer: item.buffer,
         cap: item.cap,
       });
 
-      // In production: Call Nykaa REST API (1 SKU per call)
+      if (publishQty === Number(item.last_pushed_qty)) {
+        await this.updatePushedVersionOnly(Channel.NYKAA, item.sku, Number(item.version));
+        continue;
+      }
+
+      this.nykaaTokens--;
+      await this.sendToNykaa(item.sku, publishQty);
       await this.recordPushSuccess(Channel.NYKAA, item.sku, publishQty, Number(item.version));
+    }
+  }
+
+  /**
+   * Blinkit: 1 SKU per call, rate-limited to 4 req/s, prioritised
+   */
+  private async pushToBlinkit(velocities: Map<string, number>): Promise<void> {
+    const dirtySkus = await this.fetchDirtySkus(Channel.BLINKIT);
+    const sorted = this.prioritizeSkus(Channel.BLINKIT, dirtySkus, velocities);
+
+    for (const item of sorted) {
+      if (this.blinkitTokens <= 0) break;
+
+      const velocity = velocities.get(item.sku) ?? Number(process.env.SALE_PLANNED_VELOCITY || 0);
+      const publishQty = calculatePublishableStock({
+        channel: Channel.BLINKIT,
+        sku: item.sku,
+        available: Number(item.available),
+        velocityPerMin: velocity,
+        buffer: item.buffer,
+        cap: item.cap,
+      });
+
+      if (publishQty === Number(item.last_pushed_qty)) {
+        await this.updatePushedVersionOnly(Channel.BLINKIT, item.sku, Number(item.version));
+        continue;
+      }
+
+      this.blinkitTokens--;
+      await this.sendToBlinkit(item.sku, publishQty);
+      await this.recordPushSuccess(Channel.BLINKIT, item.sku, publishQty, Number(item.version));
     }
   }
 
   /**
    * Flipkart: Bulk API up to 50 SKUs per call, rate-limited to 8 req/s
    */
-  private async pushToFlipkart(): Promise<void> {
+  private async pushToFlipkart(velocities: Map<string, number>): Promise<void> {
     const dirtySkus = await this.fetchDirtySkus(Channel.FLIPKART);
     if (dirtySkus.length === 0) return;
 
-    const sorted = this.prioritizeSkus(dirtySkus);
+    const sorted = this.prioritizeSkus(Channel.FLIPKART, dirtySkus, velocities);
+    const toPush: { item: DirtySkuRow; publishQty: number }[] = [];
 
-    // Batch up to 50 SKUs per request
-    while (sorted.length > 0 && this.flipkartTokens > 0) {
-      this.flipkartTokens--;
-      const batch = sorted.splice(0, 50);
-
-      const updates = batch.map((item) => ({
-        sku: item.sku,
-        version: Number(item.version),
-        publishQty: calculatePublishableStock({
-          channel: Channel.FLIPKART,
-          sku: item.sku,
-          available: Number(item.available),
-          velocityPerMin: 15,
-          buffer: item.buffer,
-          cap: item.cap,
-        }),
-      }));
-
-      // In production: Call Flipkart Bulk Inventory API
-      for (const u of updates) {
-        await this.recordPushSuccess(Channel.FLIPKART, u.sku, u.publishQty, u.version);
-      }
-    }
-  }
-
-  /**
-   * Blinkit: Urgent REST for stock <= 5, otherwise routine
-   */
-  private async pushToBlinkit(): Promise<void> {
-    const dirtySkus = await this.fetchDirtySkus(Channel.BLINKIT);
-    for (const item of dirtySkus) {
+    for (const item of sorted) {
+      const velocity = velocities.get(item.sku) ?? Number(process.env.SALE_PLANNED_VELOCITY || 0);
       const publishQty = calculatePublishableStock({
-        channel: Channel.BLINKIT,
+        channel: Channel.FLIPKART,
         sku: item.sku,
         available: Number(item.available),
-        velocityPerMin: 10,
+        velocityPerMin: velocity,
         buffer: item.buffer,
+        cap: item.cap,
       });
 
-      // Urgent push if publishQty <= 5 or 0
-      if (publishQty <= 5) {
-        await this.recordPushSuccess(Channel.BLINKIT, item.sku, publishQty, Number(item.version));
+      if (publishQty === Number(item.last_pushed_qty)) {
+        await this.updatePushedVersionOnly(Channel.FLIPKART, item.sku, Number(item.version));
+        continue;
+      }
+
+      toPush.push({ item, publishQty });
+    }
+
+    while (toPush.length > 0 && this.flipkartTokens > 0) {
+      this.flipkartTokens--;
+      const batch = toPush.splice(0, 50);
+
+      const updates = batch.map((b) => ({
+        sku: b.item.sku,
+        qty: b.publishQty,
+        version: Number(b.item.version),
+      }));
+
+      await this.sendToFlipkart(updates);
+
+      for (const u of updates) {
+        await this.recordPushSuccess(Channel.FLIPKART, u.sku, u.qty, u.version);
       }
     }
   }
@@ -160,7 +222,7 @@ export class StockPushService {
   private async fetchDirtySkus(channel: Channel): Promise<DirtySkuRow[]> {
     return this.dataSource.query(
       `SELECT cs.sku, (i.on_hand - i.reserved) AS available, i.version, 
-              cs.last_pushed_qty, cs.buffer, cs.cap
+              cs.last_pushed_qty, cs.buffer, cs.cap, i.updated_at
        FROM channel_stock cs 
        JOIN inventory i USING (sku)
        WHERE cs.channel = $1 AND i.version > cs.pushed_version
@@ -171,20 +233,57 @@ export class StockPushService {
 
   /**
    * Priority Ordering:
-   * 1. Out of stock (available <= 0)
-   * 2. Low stock (available <= 5)
-   * 3. Highest version difference (oldest stale updates)
+   * 1. Going to 0 first (publishQty === 0 or available <= 0)
+   * 2. At or below channel threshold
+   * 3. Oldest change (updated_at ASC)
    */
-  private prioritizeSkus(skus: DirtySkuRow[]): DirtySkuRow[] {
+  private prioritizeSkus(
+    channel: Channel,
+    skus: DirtySkuRow[],
+    velocities: Map<string, number>,
+  ): DirtySkuRow[] {
+    const blindWindow = DEFAULT_BLIND_WINDOWS[channel] ?? 60;
+    const floor = DEFAULT_FLOORS[channel] ?? 0;
+
     return skus.sort((a, b) => {
       const aAvail = Number(a.available);
       const bAvail = Number(b.available);
-      if (aAvail <= 0 && bAvail > 0) return -1;
-      if (bAvail <= 0 && aAvail > 0) return 1;
-      if (aAvail <= 5 && bAvail > 5) return -1;
-      if (bAvail <= 5 && aAvail > 5) return 1;
-      return Number(b.version) - Number(a.version);
+
+      const aVel = (velocities.get(a.sku) ?? 0) / 60;
+      const bVel = (velocities.get(b.sku) ?? 0) / 60;
+
+      const aThreshold = Math.max(floor, Math.ceil(aVel * blindWindow * 1.5));
+      const bThreshold = Math.max(floor, Math.ceil(bVel * blindWindow * 1.5));
+
+      const aGoingToZero = aAvail <= 0 || aAvail <= (a.buffer || 0);
+      const bGoingToZero = bAvail <= 0 || bAvail <= (b.buffer || 0);
+
+      // 1. Going to 0 first
+      if (aGoingToZero && !bGoingToZero) return -1;
+      if (!aGoingToZero && bGoingToZero) return 1;
+
+      // 2. At or below threshold
+      const aBelowThreshold = aAvail <= aThreshold;
+      const bBelowThreshold = bAvail <= bThreshold;
+      if (aBelowThreshold && !bBelowThreshold) return -1;
+      if (!aBelowThreshold && bBelowThreshold) return 1;
+
+      // 3. Oldest change first (updated_at ASC)
+      return new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime();
     });
+  }
+
+  private async updatePushedVersionOnly(
+    channel: Channel,
+    sku: string,
+    inventoryVersion: number,
+  ): Promise<void> {
+    await this.dataSource.query(
+      `UPDATE channel_stock 
+       SET pushed_version = $1, updated_at = NOW()
+       WHERE channel = $2 AND sku = $3;`,
+      [inventoryVersion, channel, sku],
+    );
   }
 
   private async recordPushSuccess(
@@ -205,5 +304,22 @@ export class StockPushService {
        VALUES ($1, $2, $3, $4, 200, 15);`,
       [channel, sku, pushedQty, inventoryVersion],
     );
+  }
+
+  // Simulated channel API calls
+  private async sendToWebsite(sku: string, qty: number): Promise<void> {
+    // Simulated internal cache / API call
+  }
+
+  private async sendToNykaa(sku: string, qty: number): Promise<void> {
+    // Simulated Nykaa REST API call (1 SKU/call)
+  }
+
+  private async sendToBlinkit(sku: string, qty: number): Promise<void> {
+    // Simulated Blinkit REST API call (1 SKU/call)
+  }
+
+  private async sendToFlipkart(updates: { sku: string; qty: number }[]): Promise<void> {
+    // Simulated Flipkart Bulk API call (up to 50 SKUs/call)
   }
 }

@@ -39,17 +39,34 @@ export class OpsController {
   }
 
   /**
-   * One-click Retry endpoint for Ops Team
+   * One-click Retry endpoint for Ops Team on sync_jobs
    */
   @Post('retry/:jobId')
   async retryFailedJob(@Param('jobId') jobId: string) {
     this.logger.log(`Ops triggered manual retry for job ${jobId}`);
-    const result = await this.dataSource.query(
+    const [result] = await this.dataSource.query(
       `UPDATE sync_jobs 
        SET status = $1, next_attempt_at = NOW(), locked_until = NULL, updated_at = NOW()
        WHERE id = $2
        RETURNING id, status;`,
       [SyncJobStatus.PENDING, jobId],
+    );
+
+    return { success: true, updated: result };
+  }
+
+  /**
+   * Replay a failed inbound event (sets status back to RECEIVED for EventProcessor)
+   */
+  @Post('replay-event/:id')
+  async replayFailedEvent(@Param('id') id: string) {
+    this.logger.log(`Ops triggered replay for inbound event ${id}`);
+    const [result] = await this.dataSource.query(
+      `UPDATE inbound_events
+       SET status = 'RECEIVED', error = NULL, updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, status;`,
+      [id],
     );
 
     return { success: true, updated: result };

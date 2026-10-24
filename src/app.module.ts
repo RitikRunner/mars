@@ -17,6 +17,7 @@ import {
 import { ReservationService } from './reservation/reservation.service';
 import { WebhookController } from './ingestion/webhook.controller';
 import { FlipkartPoller } from './ingestion/flipkart.poller';
+import { EventProcessorService } from './ingestion/event-processor.service';
 import { StockPushService } from './stock-push/stock-push.service';
 import { ErpService } from './erp/erp.service';
 import { OpsController } from './ops/ops.controller';
@@ -64,6 +65,7 @@ import { MockController } from './mock/mock.controller';
   controllers: [WebhookController, OpsController, MockController],
   providers: [
     ReservationService,
+    EventProcessorService,
     FlipkartPoller,
     StockPushService,
     ErpService,

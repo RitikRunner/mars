@@ -10,8 +10,7 @@ import {
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { UnifiedOrderDto } from '../common/dto';
-import { Channel, InboundStatus, OrderStatus } from '../common/enums';
-import { InboundEvent } from '../database/entities/inbound-event.entity';
+import { Channel } from '../common/enums';
 import { ReservationService } from '../reservation/reservation.service';
 
 @Controller('webhooks')
@@ -25,17 +24,17 @@ export class WebhookController {
 
   /**
    * Own Website Webhook (Direct DB / API)
+   * Asynchronous: stores raw event and returns 200 immediately.
    */
   @Post('website')
   @HttpCode(HttpStatus.OK)
   async handleWebsiteWebhook(@Body() payload: UnifiedOrderDto) {
-    return this.ingestAndProcess(Channel.WEBSITE, payload);
+    return this.ingestRawEvent(Channel.WEBSITE, payload);
   }
 
   /**
    * Nykaa Webhook
-   * Quirks: May be sent twice or out of order.
-   * Response must be under 2s to prevent Nykaa redelivery storms.
+   * Asynchronous: stores raw event and returns 200 immediately (< 50ms).
    */
   @Post('nykaa')
   @HttpCode(HttpStatus.OK)
@@ -43,28 +42,32 @@ export class WebhookController {
     @Body() payload: UnifiedOrderDto,
     @Headers('x-nykaa-signature') signature?: string,
   ) {
-    // In production: verifyHMAC(payload, signature, secret)
-    return this.ingestAndProcess(Channel.NYKAA, payload);
+    return this.ingestRawEvent(Channel.NYKAA, payload);
   }
 
   /**
    * Blinkit Webhook
+   * Asynchronous: stores raw event and returns 200 immediately.
    */
   @Post('blinkit')
   @HttpCode(HttpStatus.OK)
   async handleBlinkitWebhook(@Body() payload: UnifiedOrderDto) {
-    return this.ingestAndProcess(Channel.BLINKIT, payload);
+    return this.ingestRawEvent(Channel.BLINKIT, payload);
   }
 
   /**
    * Synchronous Website Reservation API (Called before customer payment capture)
+   * Places a 15-minute HELD reservation on inventory. Does NOT enqueue ERP job.
    */
   @Post('checkout/reserve')
   async handleCheckoutReserve(@Body() payload: UnifiedOrderDto) {
-    const result = await this.reservationService.processOrderReservation({
-      ...payload,
-      channel: Channel.WEBSITE,
-    });
+    const result = await this.reservationService.processOrderReservation(
+      {
+        ...payload,
+        channel: Channel.WEBSITE,
+      },
+      true, // isHold = true
+    );
 
     if (result.isShort) {
       throw new HttpException(
@@ -76,34 +79,27 @@ export class WebhookController {
     return {
       success: true,
       orderId: result.orderId,
-      holdExpiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15-minute hold
+      holdExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
     };
   }
 
-  private async ingestAndProcess(channel: Channel, payload: UnifiedOrderDto) {
+  private async ingestRawEvent(channel: Channel, payload: UnifiedOrderDto) {
     const dedupeKey = `${payload.external_order_id}:${payload.event}`;
 
-    // 1. Raw event insertion with ON CONFLICT DO NOTHING
-    try {
-      await this.dataSource.query(
-        `INSERT INTO inbound_events (channel, dedupe_key, external_order_id, event_type, payload, status)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (channel, dedupe_key) DO NOTHING;`,
-        [channel, dedupeKey, payload.external_order_id, payload.event, JSON.stringify(payload), InboundStatus.RECEIVED],
-      );
-    } catch (err) {
-      this.logger.error(`Failed to record raw inbound event from ${channel}`, err.stack);
-    }
-
-    // 2. Delegate to reservation state machine
-    if (payload.event === 'ORDER_CANCELLED') {
-      await this.reservationService.cancelOrder(channel, payload.external_order_id);
-    } else {
-      await this.reservationService.processOrderReservation({
-        ...payload,
+    // Raw event insertion with ON CONFLICT DO NOTHING
+    // If this throws, NestJS returns HTTP 5xx so the channel retries
+    await this.dataSource.query(
+      `INSERT INTO inbound_events (channel, dedupe_key, external_order_id, event_type, payload, status)
+       VALUES ($1, $2, $3, $4, $5, 'RECEIVED')
+       ON CONFLICT (channel, dedupe_key) DO NOTHING;`,
+      [
         channel,
-      });
-    }
+        dedupeKey,
+        payload.external_order_id,
+        payload.event,
+        JSON.stringify(payload),
+      ],
+    );
 
     return { received: true, external_order_id: payload.external_order_id };
   }

@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Interval } from '@nestjs/schedule';
 import { DataSource } from 'typeorm';
 import { UnifiedOrderDto } from '../common/dto';
 import {
@@ -29,7 +30,7 @@ export class ReservationService {
   /**
    * Reserves stock for an incoming order within a single ACID transaction.
    *
-   * 1. Acquires order row lock (or inserts with UNIQUE conflict check).
+   * 1. Checks for existing order (idempotency, out-of-order tombstone, or HELD confirmation).
    * 2. Sorts line items by SKU to prevent deadlocks across concurrent multi-SKU orders.
    * 3. Executes atomic conditional UPDATE for each line:
    *    UPDATE inventory SET reserved = reserved + :qty, version = version + 1
@@ -39,7 +40,10 @@ export class ReservationService {
    *    - MARKETPLACE: Line marked SHORT, order BACKORDERED, alert ops, no ERP job.
    * 5. Persists Order, OrderItems, StockLedger audit rows, and ERP SyncJob atomically.
    */
-  async processOrderReservation(dto: UnifiedOrderDto): Promise<ReservationResponse> {
+  async processOrderReservation(
+    dto: UnifiedOrderDto,
+    isHold = false,
+  ): Promise<ReservationResponse> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -61,6 +65,38 @@ export class ReservationService {
           return {
             orderId: existing.id,
             status: OrderStatus.CANCELLED,
+            lines: [],
+            isShort: false,
+          };
+        }
+
+        // Website Hold Confirmation: HELD order completed payment -> move to RESERVED & enqueue ERP
+        if (existing.status === OrderStatus.HELD && dto.event === 'ORDER_CREATED') {
+          existing.status = OrderStatus.RESERVED;
+          existing.hold_expires_at = null;
+          await queryRunner.manager.save(existing);
+
+          // Enqueue ERP_CREATE job in same transaction
+          await queryRunner.manager.insert(SyncJob, {
+            type: 'ERP_CREATE',
+            aggregate_key: `order:${existing.id}`,
+            idempotency_key: `erp-create:${existing.id}`,
+            payload: {
+              orderId: existing.id,
+              channel: existing.channel,
+              externalOrderId: existing.external_order_id,
+              totalAmount: existing.total_amount,
+              pincode: existing.shipping_pincode,
+              lines: dto.items.map((l) => ({ sku: l.sku, qty: l.qty, unitPrice: l.unit_price })),
+            } as any,
+            status: SyncJobStatus.PENDING,
+            attempts: 0,
+          });
+
+          await queryRunner.commitTransaction();
+          return {
+            orderId: existing.id,
+            status: OrderStatus.RESERVED,
             lines: [],
             isShort: false,
           };
@@ -102,11 +138,12 @@ export class ReservationService {
       const lineResults: { sku: string; qty: number; status: LineStatus; unitPrice: number }[] = [];
       let hasShortfall = false;
 
-      // 3. Create initial order record
+      // 3. Create initial order record (HELD if website hold, otherwise RECEIVED)
       const order = queryRunner.manager.create(Order, {
         channel: dto.channel,
         external_order_id: dto.external_order_id,
-        status: OrderStatus.RECEIVED,
+        status: isHold ? OrderStatus.HELD : OrderStatus.RECEIVED,
+        hold_expires_at: isHold ? new Date(Date.now() + 15 * 60 * 1000) : null,
         payment_mode: dto.payment_mode,
         shipping_pincode: dto.shipping_pincode,
         total_amount: dto.total_amount,
@@ -117,7 +154,8 @@ export class ReservationService {
       // 4. Reserve line by line
       for (let i = 0; i < sortedLines.length; i++) {
         const item = sortedLines[i];
-        const res = await queryRunner.manager.query(
+        // Note: query() returns [rows, affectedCount] in TypeORM for UPDATE RETURNING
+        const [rows] = await queryRunner.manager.query(
           `UPDATE inventory 
            SET reserved = reserved + $1, version = version + 1, updated_at = NOW()
            WHERE sku = $2 AND (on_hand - reserved) >= $1
@@ -125,8 +163,8 @@ export class ReservationService {
           [item.qty, item.sku],
         );
 
-        if (res && res.length > 0) {
-          const { on_hand, reserved } = res[0];
+        if (rows && rows.length > 0) {
+          const { on_hand, reserved } = rows[0];
           lineResults.push({
             sku: item.sku,
             qty: item.qty,
@@ -155,7 +193,7 @@ export class ReservationService {
             await queryRunner.rollbackTransaction();
             this.logger.warn(`Website order ${dto.external_order_id} failed: SKU ${item.sku} OUT_OF_STOCK`);
             return {
-              status: OrderStatus.RECEIVED,
+              status: isHold ? OrderStatus.HELD : OrderStatus.RECEIVED,
               lines: [{ sku: item.sku, qty: item.qty, status: LineStatus.SHORT }],
               isShort: true,
             };
@@ -195,6 +233,10 @@ export class ReservationService {
         savedOrder.status = OrderStatus.BACKORDERED;
         await queryRunner.manager.save(savedOrder);
         // Do NOT enqueue ERP job for backordered orders until ops resolves/restocks
+      } else if (isHold) {
+        // Website hold: keep status HELD, do NOT enqueue ERP job
+        savedOrder.status = OrderStatus.HELD;
+        await queryRunner.manager.save(savedOrder);
       } else {
         savedOrder.status = OrderStatus.RESERVED;
         await queryRunner.manager.save(savedOrder);
@@ -225,8 +267,24 @@ export class ReservationService {
         lines: lineResults,
         isShort: hasShortfall,
       };
-    } catch (err) {
+    } catch (err: any) {
       await queryRunner.rollbackTransaction();
+
+      // Catch concurrent unique constraint violation (Postgres error code 23505)
+      if (err.code === '23505' || err.driverError?.code === '23505') {
+        const existing = await this.dataSource.getRepository(Order).findOne({
+          where: { channel: dto.channel, external_order_id: dto.external_order_id },
+        });
+        if (existing) {
+          return {
+            orderId: existing.id,
+            status: existing.status,
+            lines: [],
+            isShort: existing.status === OrderStatus.BACKORDERED,
+          };
+        }
+      }
+
       this.logger.error(`Transaction failed for order ${dto.external_order_id}`, err.stack);
       throw err;
     } finally {
@@ -235,7 +293,10 @@ export class ReservationService {
   }
 
   /**
-   * Releases reserved stock when an order is cancelled before dispatch.
+   * Releases reserved stock when an order is cancelled.
+   * - Cancelling a HELD order releases stock with no ERP job.
+   * - Cancelling a BACKORDERED order releases only its RESERVED lines (no ERP job).
+   * - Cancelling a RESERVED order releases stock and enqueues ERP_CANCEL.
    */
   async cancelOrder(channel: Channel, externalOrderId: string): Promise<boolean> {
     const queryRunner = this.dataSource.createQueryRunner();
@@ -270,19 +331,21 @@ export class ReservationService {
         return true;
       }
 
-      // Reverse reserved lines
+      const wasReserved = order.status === OrderStatus.RESERVED;
+
+      // Reverse reserved lines (remove GREATEST(0, ...); check constraint reserved >= 0 is backstop)
       for (const item of order.items) {
         if (item.line_status === LineStatus.RESERVED) {
-          const res = await queryRunner.manager.query(
+          const [rows] = await queryRunner.manager.query(
             `UPDATE inventory 
-             SET reserved = GREATEST(0, reserved - $1), version = version + 1, updated_at = NOW()
+             SET reserved = reserved - $1, version = version + 1, updated_at = NOW()
              WHERE sku = $2
              RETURNING on_hand, reserved, version;`,
             [item.qty, item.sku],
           );
 
-          if (res && res.length > 0) {
-            const { on_hand, reserved } = res[0];
+          if (rows && rows.length > 0) {
+            const { on_hand, reserved } = rows[0];
             await queryRunner.manager.insert(StockLedger, {
               sku: item.sku,
               delta_on_hand: 0,
@@ -305,14 +368,20 @@ export class ReservationService {
       order.status = OrderStatus.CANCELLED;
       await queryRunner.manager.save(order);
 
-      // Enqueue ERP cancellation sync job
-      await queryRunner.manager.insert(SyncJob, {
-        type: 'ERP_CANCEL',
-        aggregate_key: `order:${order.id}`,
-        idempotency_key: `erp-cancel:${order.id}`,
-        payload: { orderId: order.id, externalOrderId: order.external_order_id } as any,
-        status: SyncJobStatus.PENDING,
-      });
+      // Only enqueue ERP_CANCEL if the order was fully RESERVED (ERP_CREATE exists)
+      if (wasReserved) {
+        await queryRunner.manager.insert(SyncJob, {
+          type: 'ERP_CANCEL',
+          aggregate_key: `order:${order.id}`,
+          idempotency_key: `erp-cancel:${order.id}`,
+          payload: {
+            orderId: order.id,
+            channel: order.channel,
+            externalOrderId: order.external_order_id,
+          } as any,
+          status: SyncJobStatus.PENDING,
+        });
+      }
 
       await queryRunner.commitTransaction();
       return true;
@@ -321,6 +390,72 @@ export class ReservationService {
       throw err;
     } finally {
       await queryRunner.release();
+    }
+  }
+
+  /**
+   * Sweeper for expired website HELD orders.
+   * Runs every 60 seconds. Releases stock and marks order CANCELLED with ledger HOLD_EXPIRED.
+   */
+  @Interval(60000)
+  async sweepExpiredHolds(): Promise<void> {
+    const expiredOrders = await this.dataSource.getRepository(Order).find({
+      where: {
+        status: OrderStatus.HELD,
+      },
+      relations: ['items'],
+    });
+
+    const now = new Date();
+    for (const order of expiredOrders) {
+      if (order.hold_expires_at && order.hold_expires_at < now) {
+        const queryRunner = this.dataSource.createQueryRunner();
+        await queryRunner.connect();
+        await queryRunner.startTransaction();
+
+        try {
+          for (const item of order.items) {
+            if (item.line_status === LineStatus.RESERVED) {
+              const [rows] = await queryRunner.manager.query(
+                `UPDATE inventory 
+                 SET reserved = reserved - $1, version = version + 1, updated_at = NOW()
+                 WHERE sku = $2
+                 RETURNING on_hand, reserved, version;`,
+                [item.qty, item.sku],
+              );
+
+              if (rows && rows.length > 0) {
+                const { on_hand, reserved } = rows[0];
+                await queryRunner.manager.insert(StockLedger, {
+                  sku: item.sku,
+                  delta_on_hand: 0,
+                  delta_reserved: -item.qty,
+                  on_hand_after: Number(on_hand),
+                  reserved_after: Number(reserved),
+                  available_after: Number(on_hand) - Number(reserved),
+                  reason: AuditReason.HOLD_EXPIRED,
+                  ref_type: 'ORDER_LINE',
+                  ref_id: `${order.id}:${item.line_no}`,
+                  channel: order.channel,
+                  actor: 'SYSTEM',
+                });
+              }
+              item.line_status = LineStatus.RELEASED;
+              await queryRunner.manager.save(item);
+            }
+          }
+
+          order.status = OrderStatus.CANCELLED;
+          await queryRunner.manager.save(order);
+          await queryRunner.commitTransaction();
+          this.logger.log(`Expired hold for order ${order.external_order_id} released`);
+        } catch (err) {
+          await queryRunner.rollbackTransaction();
+          this.logger.error(`Failed to release expired hold on order ${order.id}`, err);
+        } finally {
+          await queryRunner.release();
+        }
+      }
     }
   }
 }

@@ -288,4 +288,4 @@ All outbound work is a `sync_jobs` row (ERP) or a dirty `channel_stock` row (cha
 
 ## AI usage
 
-Used Claude & Gemini to review the brief, pressure-test the concurrency and failure design, format Markdown, and generate architectural Mermaid assets; I reviewed every section and can defend each decision on the call.
+Used Claude (Anthropic) and Gemini to analyse the brief, draft and edit this document, generate the Mermaid diagram, pressure-test the concurrency and failure design, and generate and debug the prototype code in src/. I reviewed every section and the code, and can defend each decision.

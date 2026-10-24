@@ -1,8 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { DataSource } from 'typeorm';
-import { ReservationService } from '../reservation/reservation.service';
-import { Channel, InboundStatus } from '../common/enums';
+import { Channel } from '../common/enums';
 import { UnifiedOrderDto } from '../common/dto';
 
 @Injectable()
@@ -11,15 +10,13 @@ export class FlipkartPoller {
   private lastWatermark: Date = new Date(Date.now() - 3600 * 1000); // 1 hour ago initially
   private isPolling = false;
 
-  constructor(
-    private readonly dataSource: DataSource,
-    private readonly reservationService: ReservationService,
-  ) {}
+  constructor(private readonly dataSource: DataSource) {}
 
   /**
    * Flipkart Polling Service
    * Runs every 2 minutes (120,000ms).
    * Fetches orders modified since `watermark - 10 minutes` to handle late writes.
+   * Only inserts raw events into inbound_events; EventProcessorService claims and applies them.
    */
   @Interval(120000)
   async pollFlipkartOrders(): Promise<void> {
@@ -37,21 +34,15 @@ export class FlipkartPoller {
       const orders = await this.fetchMockFlipkartOrders(fetchWindowStart);
 
       for (const order of orders) {
-        const dedupeKey = `FLIPKART:${order.external_order_id}:${order.event}`;
+        const dedupeKey = `${order.external_order_id}:${order.event}`;
 
-        // Raw event ingestion
+        // Raw event ingestion only
         await this.dataSource.query(
           `INSERT INTO inbound_events (channel, dedupe_key, external_order_id, event_type, payload, status)
-           VALUES ($1, $2, $3, $4, $5, $6)
+           VALUES ($1, $2, $3, $4, $5, 'RECEIVED')
            ON CONFLICT (channel, dedupe_key) DO NOTHING;`,
-          [Channel.FLIPKART, dedupeKey, order.external_order_id, order.event, JSON.stringify(order), InboundStatus.RECEIVED],
+          [Channel.FLIPKART, dedupeKey, order.external_order_id, order.event, JSON.stringify(order)],
         );
-
-        if (order.event === 'ORDER_CANCELLED') {
-          await this.reservationService.cancelOrder(Channel.FLIPKART, order.external_order_id);
-        } else {
-          await this.reservationService.processOrderReservation(order);
-        }
       }
 
       this.lastWatermark = new Date();
