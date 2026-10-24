@@ -1,0 +1,44 @@
+export enum Channel {
+  WEBSITE = 'WEBSITE',
+  NYKAA = 'NYKAA',
+  FLIPKART = 'FLIPKART',
+  BLINKIT = 'BLINKIT',
+}
+
+export enum OrderStatus {
+  RECEIVED = 'RECEIVED',
+  HELD = 'HELD',
+  RESERVED = 'RESERVED',
+  BACKORDERED = 'BACKORDERED',
+  SHIPPED = 'SHIPPED',
+  CANCELLED = 'CANCELLED',
+}
+
+export enum LineStatus {
+  RESERVED = 'RESERVED',
+  SHORT = 'SHORT',
+  RELEASED = 'RELEASED',
+  SHIPPED = 'SHIPPED',
+}
+
+export enum AuditReason {
+  RESERVE = 'RESERVE',
+  CANCEL_RELEASE = 'CANCEL_RELEASE',
+  RETURN_RESTOCK = 'RETURN_RESTOCK',
+  DAMAGE_WRITEOFF = 'DAMAGE_WRITEOFF',
+}
+
+export enum SyncJobStatus {
+  PENDING = 'PENDING',
+  RUNNING = 'RUNNING',
+  SUCCEEDED = 'SUCCEEDED',
+  RETRY = 'RETRY',
+  DEAD = 'DEAD',
+  DISCARDED = 'DISCARDED',
+}
+
+export enum InboundStatus {
+  RECEIVED = 'RECEIVED',
+  PROCESSED = 'PROCESSED',
+  FAILED = 'FAILED',
+}

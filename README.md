@@ -1,6 +1,6 @@
 # Mars Cosmetics — Order & Inventory Sync Service
 
-Engineering assessment submission for the **Order & Inventory Sync Service**.
+Engineering assessment submission and reference implementation for the **Order & Inventory Sync Service**.
 
 ---
 
@@ -28,14 +28,80 @@ Engineering assessment submission for the **Order & Inventory Sync Service**.
 
 ---
 
+## Getting Started (Runnable Implementation)
+
+The repository includes a complete, production-grade **NestJS + TypeScript** implementation validating all concurrency guarantees, publish policies, outbox draining, and ops screens.
+
+### 1. Prerequisites
+* Node.js v20+
+* Docker & Docker Compose (optional, for local PostgreSQL & Redis)
+
+### 2. Environment Setup
+```bash
+cp .env.example .env
+npm install
+```
+
+### 3. Spin up Local Database & Redis
+```bash
+docker-compose up -d
+```
+*(Automatically creates tables and seeds the 10 Mars Cosmetics hero SKUs and channel listings from `init-db.sql`)*
+
+### 4. Run the Automated Test Suite
+```bash
+npm test
+```
+Runs the unit and concurrency invariant test suites:
+* **`publish-policy.spec.ts`**: Validates blind window formula, velocity scaling, and Flipkart/Blinkit threshold cutoffs.
+* **`reservation.service.spec.ts`**: Proves atomic conditional updates, zero-oversell guarantees, marketplace SHORT line handling, and out-of-order tombstone reconciliation.
+
+### 5. Start the Service
+```bash
+npm run start:dev
+```
+Application launches on `http://localhost:3000`.
+
+---
+
+## API Surface
+
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/webhooks/website` | `POST` | Ingests orders and cancellations from Mars's own website. |
+| `/webhooks/nykaa` | `POST` | Ingests Nykaa orders with duplicate and out-of-order resilience (< 50ms ack). |
+| `/webhooks/blinkit` | `POST` | Ingests Blinkit quick-commerce orders. |
+| `/webhooks/checkout/reserve`| `POST` | Synchronous website reservation API called before customer payment capture. |
+| `/ops/failed-syncs` | `GET` | **Ops Screen:** Lists all failed/dead sync jobs and unmapped inbound events. |
+| `/ops/retry/:jobId` | `POST` | **Ops Screen:** One-click manual retry for any failed sync job. |
+| `/ops/sku-timeline/:sku` | `GET` | **Audit Trail:** Returns complete immutable ledger and push history for any SKU. |
+| `/mock/erp/salesOrders` | `POST` | Mock Microsoft Business Central endpoint for testing. |
+| `/mock/erp/toggle-maintenance` | `POST` | Toggles simulated Sunday maintenance downtime to verify outbox buffering. |
+
+---
+
 ## Project Structure
 
 ```
+├── src/
+│   ├── common/            # Enums, DTOs, and velocity-based Publish Policy math
+│   ├── database/
+│   │   └── entities/      # TypeORM schema (Inventory, Orders, Ledger, Outbox, etc.)
+│   ├── ingestion/         # Webhook controllers and Flipkart 2-min poller
+│   ├── reservation/       # Core atomic concurrency engine (conditional updates)
+│   │   └── reservation.service.ts
+│   ├── stock-push/        # Rate-governed push workers (Nykaa 4 rps, Flipkart 8 rps)
+│   ├── erp/               # Transactional Outbox worker with SKIP LOCKED
+│   ├── ops/               # Ops UI endpoints (failed sync list, retry, SKU timeline)
+│   ├── mock/              # Mock ERP & maintenance toggles
+│   ├── app.module.ts
+│   └── main.ts
+├── init-db.sql            # PostgreSQL DDL and seed data
+├── docker-compose.yml     # Local PostgreSQL 16 & Redis 7
 ├── DESIGN.md              # System design document (<= 4 pages)
 ├── architecture.png       # Exported architecture diagram
 ├── architecture.mmd       # Mermaid diagram source file
 ├── CALL_PREP.md           # Internal interview prep (do not submit)
-├── README.md              # Repository overview
 └── design/
     ├── DESIGN.md          # Mirror copy for /design folder submission
     ├── architecture.png   # Mirror copy of diagram
