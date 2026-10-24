@@ -71,7 +71,7 @@ export class ReservationService {
         }
 
         // Website Hold Confirmation: HELD order completed payment -> move to RESERVED & enqueue ERP
-        if (existing.status === OrderStatus.HELD && dto.event === 'ORDER_CREATED') {
+        if (existing.status === OrderStatus.HELD && dto.event === 'ORDER_CREATED' && !isHold) {
           existing.status = OrderStatus.RESERVED;
           existing.hold_expires_at = null;
           await queryRunner.manager.save(existing);
@@ -306,7 +306,6 @@ export class ReservationService {
     try {
       const order = await queryRunner.manager.findOne(Order, {
         where: { channel, external_order_id: externalOrderId },
-        relations: ['items'],
         lock: { mode: 'pessimistic_write' },
       });
 
@@ -332,9 +331,12 @@ export class ReservationService {
       }
 
       const wasReserved = order.status === OrderStatus.RESERVED;
+      const items = await queryRunner.manager.find(OrderItem, {
+        where: { order_id: order.id },
+      });
 
       // Reverse reserved lines (remove GREATEST(0, ...); check constraint reserved >= 0 is backstop)
-      for (const item of order.items) {
+      for (const item of items) {
         if (item.line_status === LineStatus.RESERVED) {
           const [rows] = await queryRunner.manager.query(
             `UPDATE inventory 
@@ -403,7 +405,6 @@ export class ReservationService {
       where: {
         status: OrderStatus.HELD,
       },
-      relations: ['items'],
     });
 
     const now = new Date();
@@ -414,7 +415,26 @@ export class ReservationService {
         await queryRunner.startTransaction();
 
         try {
-          for (const item of order.items) {
+          const locked = await queryRunner.manager.findOne(Order, {
+            where: { id: order.id },
+            lock: { mode: 'pessimistic_write' },
+          });
+
+          if (
+            !locked ||
+            locked.status !== OrderStatus.HELD ||
+            !locked.hold_expires_at ||
+            locked.hold_expires_at >= new Date()
+          ) {
+            await queryRunner.rollbackTransaction();
+            continue;
+          }
+
+          const items = await queryRunner.manager.find(OrderItem, {
+            where: { order_id: locked.id },
+          });
+
+          for (const item of items) {
             if (item.line_status === LineStatus.RESERVED) {
               const [rows] = await queryRunner.manager.query(
                 `UPDATE inventory 
@@ -435,8 +455,8 @@ export class ReservationService {
                   available_after: Number(on_hand) - Number(reserved),
                   reason: AuditReason.HOLD_EXPIRED,
                   ref_type: 'ORDER_LINE',
-                  ref_id: `${order.id}:${item.line_no}`,
-                  channel: order.channel,
+                  ref_id: `${locked.id}:${item.line_no}`,
+                  channel: locked.channel,
                   actor: 'SYSTEM',
                 });
               }
@@ -445,10 +465,10 @@ export class ReservationService {
             }
           }
 
-          order.status = OrderStatus.CANCELLED;
-          await queryRunner.manager.save(order);
+          locked.status = OrderStatus.CANCELLED;
+          await queryRunner.manager.save(locked);
           await queryRunner.commitTransaction();
-          this.logger.log(`Expired hold for order ${order.external_order_id} released`);
+          this.logger.log(`Expired hold for order ${locked.external_order_id} released`);
         } catch (err) {
           await queryRunner.rollbackTransaction();
           this.logger.error(`Failed to release expired hold on order ${order.id}`, err);

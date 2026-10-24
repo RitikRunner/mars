@@ -18,6 +18,7 @@ describe('ReservationService - Concurrency & Invariant Tests', () => {
       release: jest.fn(),
       manager: {
         findOne: jest.fn(),
+        find: jest.fn(),
         create: jest.fn((entity, data) => ({ id: 'mock-order-id', ...data })),
         save: jest.fn((entity) => Promise.resolve(entity)),
         insert: jest.fn(() => Promise.resolve()),
@@ -244,6 +245,9 @@ describe('ReservationService - Concurrency & Invariant Tests', () => {
       ],
     };
     mockQueryRunner.manager.findOne.mockResolvedValue(heldOrder);
+    mockQueryRunner.manager.find.mockResolvedValue([
+      { sku: 'MRS-LIP-104', qty: 1, line_status: LineStatus.RESERVED, line_no: 1 },
+    ]);
     mockQueryRunner.manager.query.mockResolvedValue([
       [{ on_hand: 10, reserved: 0, version: 3 }],
       1,
